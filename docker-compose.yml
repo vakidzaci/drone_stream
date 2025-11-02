@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  nginx-rtmp:
+    image: tiangolo/nginx-rtmp:latest
+    container_name: rtmp-server
+    ports:
+      - "1935:1935"
+      - "8080:8080"
+    networks:
+      - yolo-net
+    restart: unless-stopped
+
+  yolo-tracker:
+    image: yolo-tracker:latest
+    container_name: yolo-tracker
+    depends_on:
+      - nginx-rtmp
+    volumes:
+      - ./yolo-tracker/tracker.py:/app/tracker.py
+      - /home/vakidzaci/PycharmProjects/dota_detect/weights/all_int8_openvino_model:/app/all_int8_openvino_model:ro
+    networks:
+      - yolo-net
+    command: >
+      python tracker.py
+      --weights /app/all_int8_openvino_model
+      --source rtmp://nginx-rtmp:1935/live/stream
+      --output-rtmp rtmp://nginx-rtmp:1935/live/tracked
+      --device cpu
+      --conf 0.5
+    restart: unless-stopped
+
+networks:
+  yolo-net:
+    driver: bridge

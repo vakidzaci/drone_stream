@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>YOLO Tracker - Live View</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #1a1a1a;
+            color: white;
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+        h1 {
+            color: #4CAF50;
+        }
+        .status {
+            padding: 10px 20px;
+            border-radius: 5px;
+            margin: 10px 0;
+            font-weight: bold;
+        }
+        .status.offline { background: #f44336; }
+        .status.online { background: #4CAF50; }
+        .status.waiting { background: #ff9800; }
+        #video-container {
+            width: 90%;
+            max-width: 1280px;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+        }
+        video {
+            width: 100%;
+            height: auto;
+            display: block;
+        }
+        .info {
+            margin-top: 20px;
+            padding: 15px;
+            background: #2a2a2a;
+            border-radius: 5px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎯 YOLO Object Tracker</h1>
+    <div class="status waiting" id="status">Waiting for stream...</div>
+
+    <div id="video-container">
+        <video id="video" controls muted autoplay></video>
+    </div>
+
+    <div class="info">
+        <p>Stream URL: <code>http://localhost:8080/hls/tracked.m3u8</code></p>
+        <p id="retry-info"></p>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const statusEl = document.getElementById('status');
+        const retryInfo = document.getElementById('retry-info');
+        const streamUrl = 'http://localhost:8080/hls/tracked.m3u8';
+
+        let hls = null;
+        let retryCount = 0;
+        let retryTimeout = null;
+
+        function updateStatus(state, message) {
+            statusEl.className = `status ${state}`;
+            statusEl.textContent = message;
+        }
+
+        function initPlayer() {
+            retryCount++;
+            retryInfo.textContent = `Connection attempt: ${retryCount}`;
+
+            if (Hls.isSupported()) {
+                if (hls) {
+                    hls.destroy();
+                }
+
+                hls = new Hls({
+                    debug: false,
+                    enableWorker: true,
+                    lowLatencyMode: true,
+                });
+
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    console.log('Stream connected!');
+                    updateStatus('online', '🟢 LIVE');
+                    retryCount = 0;
+                    video.play().catch(e => console.log('Autoplay prevented:', e));
+                });
+
+                hls.on(Hls.Events.ERROR, (event, data) => {
+                    console.log('HLS Error:', data.type, data.details);
+
+                    if (data.fatal) {
+                        updateStatus('waiting', 'Stream not available, retrying...');
+
+                        // Retry after 3 seconds
+                        clearTimeout(retryTimeout);
+                        retryTimeout = setTimeout(() => {
+                            console.log('Retrying connection...');
+                            initPlayer();
+                        }, 3000);
+                    }
+                });
+
+                hls.loadSource(streamUrl);
+                hls.attachMedia(video);
+
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                // Native HLS support (Safari)
+                video.src = streamUrl;
+                video.addEventListener('loadedmetadata', () => {
+                    updateStatus('online', '🟢 LIVE');
+                    retryCount = 0;
+                });
+                video.addEventListener('error', () => {
+                    updateStatus('waiting', 'Stream not available, retrying...');
+                    clearTimeout(retryTimeout);
+                    retryTimeout = setTimeout(initPlayer, 3000);
+                });
+            } else {
+                updateStatus('offline', '❌ Browser not supported');
+            }
+        }
+
+        // Start trying to connect
+        updateStatus('waiting', 'Connecting to stream...');
+        initPlayer();
+    </script>
+</body>
+</html>
