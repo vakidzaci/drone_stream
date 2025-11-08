@@ -18,7 +18,7 @@ services:
       - nginx-rtmp
     volumes:
       - ./yolo-tracker/tracker.py:/app/tracker.py
-      - /home/vakidzaci/PycharmProjects/dota_detect/weights/all_int8_openvino_model:/app/all_int8_openvino_model:ro
+      - ./models/.:/app/all_int8_openvino_model/.:ro
     networks:
       - yolo-net
     command: >
@@ -28,6 +28,7 @@ services:
       --output-rtmp rtmp://nginx-rtmp:1935/live/tracked
       --device cpu
       --conf 0.5
+      --imgsz 256
     restart: unless-stopped
 
 networks:

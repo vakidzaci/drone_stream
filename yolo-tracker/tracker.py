@@ -7,29 +7,12 @@ from scipy.optimize import linear_sum_assignment
 from pathlib import Path
 import cv2
 from ultralytics import YOLO
-
+import queue
 
 def is_net(src: str) -> bool:
     return bool(re.match(r"^(rtmp|rtsp|http)s?://", str(src), re.I))
 
 
-def parse_args():
-    p = argparse.ArgumentParser("YOLO + SORT + RTMP Output")
-    p.add_argument("--weights", type=str, required=True)
-    p.add_argument("--source", type=str, default='rtmp://nginx-rtmp:1935/live/stream')
-    p.add_argument("--device", type=str, default="cpu")
-    p.add_argument("--imgsz", type=int, default=640)
-    p.add_argument("--conf", type=float, default=0.50)
-    p.add_argument("--iou", type=float, default=0.45)
-    p.add_argument("--max-det", type=int, default=50)
-    p.add_argument("--classes", type=str, default="")
-    p.add_argument("--max-age", type=int, default=30)
-    p.add_argument("--min-hits", type=int, default=3)
-    p.add_argument("--iou-threshold", type=float, default=0.3)
-    p.add_argument("--max-area-frac", type=float, default=0.25)
-    p.add_argument("--output-rtmp", type=str, required=True, help="RTMP output URL")  # CHANGED
-    p.add_argument("--fps", type=int, default=25, help="Output FPS")
-    return p.parse_args()
 
 
 
@@ -202,45 +185,121 @@ def parse_args():
     return p.parse_args()
 
 
-class RTMPWriter:
-    """Write frames to RTMP using FFmpeg"""
-
-    def __init__(self, rtmp_url, width, height, fps=25):
+class RTMPStreamer:
+    def __init__(self, rtmp_url, width, height, fps=30):
         self.rtmp_url = rtmp_url
+        self.width = width
+        self.height = height
+        self.fps = fps
         self.process = None
+        self.frame_queue = queue.Queue(maxsize=10)  # Limit queue size
+        self.running = False
 
+    def start(self):
         cmd = [
             'ffmpeg',
             '-y',
             '-f', 'rawvideo',
             '-vcodec', 'rawvideo',
             '-pix_fmt', 'bgr24',
-            '-s', f'{width}x{height}',
-            '-r', str(fps),
-            '-i', '-',
+            '-s', f'{self.width}x{self.height}',
+            '-r', str(self.fps),
+            '-i', '-',  # Read from stdin
             '-c:v', 'libx264',
             '-preset', 'ultrafast',
             '-tune', 'zerolatency',
             '-profile:v', 'baseline',
             '-pix_fmt', 'yuv420p',
-            '-f', 'flv',  # FLV format for RTMP
-            rtmp_url
+            '-b:v', '3000k',  # Bitrate limit
+            '-maxrate', '3000k',
+            '-bufsize', '6000k',
+            '-g', str(self.fps * 2),  # Keyframe interval
+            '-f', 'flv',
+            self.rtmp_url
         ]
 
-        self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        print(f"[RTMP] Started streaming to {rtmp_url}")
+        self.process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=10 ** 8  # Large buffer
+        )
 
-    def write(self, frame):
+        self.running = True
+
+        # Start thread to consume stderr (prevent blocking)
+        self.stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self.stderr_thread.start()
+
+        # Start thread to write frames
+        self.write_thread = threading.Thread(target=self._write_frames, daemon=True)
+        self.write_thread.start()
+
+        print(f"[RTMP] Streaming to {self.rtmp_url}")
+
+    def _read_stderr(self):
+        """Consume stderr to prevent pipe blocking"""
+        while self.running:
+            try:
+                line = self.process.stderr.readline()
+                if not line:
+                    break
+                # Optionally print errors
+                # print(f"[FFmpeg] {line.decode().strip()}")
+            except:
+                break
+
+    def _write_frames(self):
+        """Write frames from queue to FFmpeg stdin"""
+        while self.running:
+            try:
+                frame = self.frame_queue.get(timeout=1)
+                if frame is None:  # Poison pill
+                    break
+                self.process.stdin.write(frame.tobytes())
+            except queue.Empty:
+                continue
+            except BrokenPipeError:
+                print("[RTMP] Broken pipe - FFmpeg died")
+                break
+            except Exception as e:
+                print(f"[RTMP] Write error: {e}")
+                break
+
+    def write_frame(self, frame):
+        """Add frame to queue (non-blocking)"""
+        try:
+            self.frame_queue.put_nowait(frame)
+        except queue.Full:
+            # Drop frame if queue is full (prevents blocking)
+            pass
+
+    def stop(self):
+        """Stop streaming"""
+        self.running = False
+
+        # Send poison pill
+        try:
+            self.frame_queue.put(None, timeout=1)
+        except:
+            pass
+
+        # Close stdin
         if self.process and self.process.stdin:
             try:
-                self.process.stdin.write(frame.tobytes())
+                self.process.stdin.close()
             except:
                 pass
 
-    def release(self):
+        # Wait for process
         if self.process:
-            self.process.stdin.close()
-            self.process.wait()
+            try:
+                self.process.wait(timeout=2)
+            except:
+                self.process.kill()
+
+        print("[RTMP] Streaming stopped")
 class HLSWriter:
     """Write frames to HLS using FFmpeg"""
 
@@ -283,9 +342,22 @@ class HLSWriter:
             self.process.stdin.close()
             self.process.wait()
 
+
+def create_waiting_frame(width=1280, height=720, message="Waiting for input..."):
+    """Create a placeholder frame"""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw, th), _ = cv2.getTextSize(message, font, 1.0, 2)
+    x = (width - tw) // 2
+    y = (height + th) // 2
+    cv2.putText(frame, message, (x, y), font, 1.0, (0, 165, 255), 2)
+    return frame
+
+
 def main():
     args = parse_args()
 
+    # Load model
     weights_path = Path(args.weights)
     if not weights_path.exists():
         raise FileNotFoundError(f"Model not found: {args.weights}")
@@ -307,119 +379,151 @@ def main():
     np.random.seed(42)
     colors = np.random.randint(0, 255, size=(200, 3), dtype=np.uint8)
 
-    # Open stream with timeout
-    print(f"[INFO] Connecting to: {args.source}")
-    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp|timeout;5000000'
+    # Initialize RTMP writer FIRST with default dimensions
+    default_width = 1280
+    default_height = 720
+
+    print(f"[INFO] Starting RTMP output to: {args.output_rtmp}")
+    rtmp_writer = RTMPStreamer(args.output_rtmp, default_width, default_height, args.fps)
+    rtmp_writer.start()
+
+    # Create waiting frame
+    waiting_frame = create_waiting_frame(default_width, default_height)
 
     cap = None
-    rtmp_writer = None  # ← CHANGED from hls_writer
     frame_count = 0
+    stream_active = False
 
-    while True:
-        # Try to connect
-        if cap is None or not cap.isOpened():
-            cap = cv2.VideoCapture(args.source, cv2.CAP_FFMPEG)
-            if not cap.isOpened():
-                print("[WARN] Connection failed, retrying in 3s...")
-                time.sleep(3)
+    print(f"[INFO] Connecting to input: {args.source}")
+
+    try:
+        while True:
+            # Try to connect if not connected
+            if cap is None or not cap.isOpened():
+                if stream_active:
+                    print("[WARN] Input stream lost, switching to waiting mode...")
+                    stream_active = False
+
+                cap = cv2.VideoCapture(args.source, cv2.CAP_FFMPEG)
+
+                if not cap.isOpened():
+                    # Send waiting frame
+                    rtmp_writer.write_frame(waiting_frame)
+                    time.sleep(0.04)  # ~25fps
+                    continue
+
+                # Get stream properties
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = cap.get(cv2.CAP_PROP_FPS) or args.fps
+
+                print(f"[INFO] Input connected: {width}x{height} @ {fps:.1f} FPS")
+
+                # Restart writer with correct dimensions if needed
+                if width != rtmp_writer.width or height != rtmp_writer.height:
+                    print(f"[INFO] Restarting RTMP writer with new dimensions...")
+                    rtmp_writer.stop()
+                    rtmp_writer = RTMPStreamer(args.output_rtmp, width, height, args.fps)
+                    rtmp_writer.start()
+                    waiting_frame = create_waiting_frame(width, height)
+
+                stream_active = True
+                frame_count = 0
+
+            # Try to read frame
+            ret, frame = cap.read()
+            if not ret:
+                # Send waiting frame on failure
+                rtmp_writer.write_frame(waiting_frame)
+
+                if stream_active:
+                    print("[WARN] Failed to read frame, reconnecting...")
+                    stream_active = False
+
+                cap.release()
+                cap = None
+                time.sleep(1)
                 continue
 
-            # Get stream properties
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS) or args.fps
+            frame_count += 1
 
-            print(f"[INFO] Connected: {width}x{height} @ {fps:.1f} FPS")
+            # Run detection
+            results = model(
+                frame,
+                imgsz=args.imgsz,
+                conf=args.conf,
+                iou=args.iou,
+                max_det=args.max_det,
+                classes=classes,
+                verbose=False,
+            )
 
-            # Initialize RTMP writer
-            if rtmp_writer is None:  # ← CHANGED
-                rtmp_writer = RTMPWriter(args.output_rtmp, width, height, args.fps)  # ← CHANGED
+            # Extract detections
+            boxes = results[0].boxes
+            if len(boxes) > 0:
+                dets = boxes.xyxy.cpu().numpy()
+                scores = boxes.conf.cpu().numpy()
 
-        ret, frame = cap.read()
-        if not ret:
-            print("[WARN] Stream lost, reconnecting...")
-            cap.release()
-            cap = None
-            time.sleep(1)
-            continue
+                # Filter by area
+                if args.max_area_frac > 0:
+                    frame_area = frame.shape[0] * frame.shape[1]
+                    areas = (dets[:, 2] - dets[:, 0]) * (dets[:, 3] - dets[:, 1])
+                    valid_mask = areas <= (frame_area * args.max_area_frac)
+                    dets = dets[valid_mask]
+                    scores = scores[valid_mask]
 
-        frame_count += 1
-
-
-
-        # Run detection
-        results = model(
-            frame,
-            imgsz=args.imgsz,
-            conf=args.conf,
-            iou=args.iou,
-            max_det=args.max_det,
-            classes=classes,
-            verbose=False,
-        )
-
-        # Extract detections
-        boxes = results[0].boxes
-        if len(boxes) > 0:
-            dets = boxes.xyxy.cpu().numpy()
-            scores = boxes.conf.cpu().numpy()
-
-            # Filter by area
-            if args.max_area_frac > 0:
-                frame_area = frame.shape[0] * frame.shape[1]
-                areas = (dets[:, 2] - dets[:, 0]) * (dets[:, 3] - dets[:, 1])
-                valid_mask = areas <= (frame_area * args.max_area_frac)
-                dets = dets[valid_mask]
-                scores = scores[valid_mask]
-
-            if len(dets) > 0:
-                dets_with_score = np.column_stack((dets, scores))
-                tracks = tracker.update(dets_with_score)
+                if len(dets) > 0:
+                    dets_with_score = np.column_stack((dets, scores))
+                    tracks = tracker.update(dets_with_score)
+                else:
+                    tracks = tracker.update(np.empty((0, 5)))
             else:
                 tracks = tracker.update(np.empty((0, 5)))
-        else:
-            tracks = tracker.update(np.empty((0, 5)))
 
-        # Draw tracks
-        output_frame = frame.copy()
-        for track in tracker.trackers:
-            d = track.get_state()[0]
-            track_id = int(track.id)
-            x1, y1, x2, y2 = map(int, d)
+            # Draw tracks
+            output_frame = frame.copy()
+            for track in tracker.trackers:
+                d = track.get_state()[0]
+                track_id = int(track.id)
+                x1, y1, x2, y2 = map(int, d)
 
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(frame.shape[1], x2)
-            y2 = min(frame.shape[0], y2)
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(frame.shape[1], x2)
+                y2 = min(frame.shape[0], y2)
 
-            color = tuple(map(int, colors[track_id % len(colors)]))
-            thickness = 2 if track.hit_streak >= args.min_hits else 1
+                color = tuple(map(int, colors[track_id % len(colors)]))
+                thickness = 2 if track.hit_streak >= args.min_hits else 1
 
-            cv2.rectangle(output_frame, (x1, y1), (x2, y2), color, thickness)
+                cv2.rectangle(output_frame, (x1, y1), (x2, y2), color, thickness)
 
-            label = f"ID:{track_id}"
-            if track.time_since_update > 0:
-                label += f" ({track.time_since_update})"
+                label = f"ID:{track_id}"
+                if track.time_since_update > 0:
+                    label += f" ({track.time_since_update})"
 
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(output_frame, (x1, y1 - th - 4), (x1 + tw + 4, y1), color, -1)
-            cv2.putText(output_frame, label, (x1 + 2, y1 - 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(output_frame, (x1, y1 - th - 4), (x1 + tw + 4, y1), color, -1)
+                cv2.putText(output_frame, label, (x1 + 2, y1 - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # Add info overlay
-        info = f"Frame: {frame_count} | Tracks: {len(tracker.trackers)}"
-        cv2.putText(output_frame, info, (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # Add info overlay
+            info = f"Frame: {frame_count} | Tracks: {len(tracker.trackers)}"
+            cv2.putText(output_frame, info, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        # Write to HLS
-        # Write to RTMP
-        rtmp_writer.write(output_frame)  # ← CHANGED from hls_writer
+            # Write to RTMP (always sends frame)
+            rtmp_writer.write_frame(output_frame)
 
-        if frame_count % 100 == 0:
-            print(f"[INFO] Processed {frame_count} frames, {len(tracker.trackers)} active tracks")
+            if frame_count % 100 == 0:
+                print(f"[INFO] Processed {frame_count} frames, {len(tracker.trackers)} active tracks")
 
-    cap.release()
-    rtmp_writer.release()  # ← CHANGED
+    except KeyboardInterrupt:
+        print("\n[INFO] Shutting down...")
+    finally:
+        if cap is not None:
+            cap.release()
+        rtmp_writer.stop()
+        print("[INFO] Stopped")
 
 
 if __name__ == "__main__":
