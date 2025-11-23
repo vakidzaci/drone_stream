@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-import argparse, os, re, signal, sys, time
+import argparse
+import re
+import time
 import threading
 import subprocess
 import numpy as np
@@ -9,14 +11,14 @@ import cv2
 from ultralytics import YOLO
 import queue
 
+
+# ---------- Utility ----------
+
 def is_net(src: str) -> bool:
     return bool(re.match(r"^(rtmp|rtsp|http)s?://", str(src), re.I))
 
 
-
-
-
-
+# ---------- SORT / Kalman Tracker ----------
 
 class KalmanBoxTracker:
     count = 0
@@ -45,6 +47,7 @@ class KalmanBoxTracker:
         self.kf.Q[-1, -1] *= 0.01
         self.kf.Q[4:, 4:] *= 0.01
         self.kf.x[:4] = self._convert_bbox_to_z(bbox)
+
         self.time_since_update = 0
         self.id = KalmanBoxTracker.count
         KalmanBoxTracker.count += 1
@@ -65,7 +68,12 @@ class KalmanBoxTracker:
     def _convert_x_to_bbox(self, x):
         w = np.sqrt(x[2] * x[3])
         h = x[2] / w if w != 0 else 0
-        return np.array([x[0] - w / 2., x[1] - h / 2., x[0] + w / 2., x[1] + h / 2.]).reshape((1, 4))
+        return np.array([
+            x[0] - w / 2.,
+            x[1] - h / 2.,
+            x[0] + w / 2.,
+            x[1] + h / 2.
+        ]).reshape((1, 4))
 
     def update(self, bbox):
         self.time_since_update = 0
@@ -99,8 +107,10 @@ def iou_batch(bb_test, bb_gt):
     w = np.maximum(0., xx2 - xx1)
     h = np.maximum(0., yy2 - yy1)
     wh = w * h
-    o = wh / ((bb_test[..., 2] - bb_test[..., 0]) * (bb_test[..., 3] - bb_test[..., 1])
-              + (bb_gt[..., 2] - bb_gt[..., 0]) * (bb_gt[..., 3] - bb_gt[..., 1]) - wh)
+    o = wh / (
+        (bb_test[..., 2] - bb_test[..., 0]) * (bb_test[..., 3] - bb_test[..., 1]) +
+        (bb_gt[..., 2] - bb_gt[..., 0]) * (bb_gt[..., 3] - bb_gt[..., 1]) - wh
+    )
     return o
 
 
@@ -124,34 +134,49 @@ class Sort:
         trks = np.ma.compress_rows(np.ma.masked_invalid(trks))
         for t in reversed(to_del):
             self.trackers.pop(t)
+
         matched, unmatched_dets, unmatched_trks = self._associate(dets, trks)
+
         for m in matched:
             self.trackers[m[1]].update(dets[m[0], :4])
+
         for i in unmatched_dets:
             trk = KalmanBoxTracker(dets[i, :4])
             self.trackers.append(trk)
+
         ret = []
         for trk in self.trackers:
-            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits):
+            if (trk.time_since_update < 1) and (
+                trk.hit_streak >= self.min_hits or self.frame_count <= self.min_hits
+            ):
                 d = trk.get_state()[0]
                 ret.append(np.concatenate((d, [trk.id])).reshape(1, -1))
+
+        # important bugfix: use tracker.time_since_update
         self.trackers = [t for t in self.trackers if t.time_since_update < self.max_age]
+
         if len(ret) > 0:
             return np.concatenate(ret)
         return np.empty((0, 5))
 
     def _associate(self, detections, trackers):
         if len(trackers) == 0:
-            return np.empty((0, 2), dtype=int), np.arange(len(detections)), np.empty((0, 5), dtype=int)
+            return (
+                np.empty((0, 2), dtype=int),
+                np.arange(len(detections)),
+                np.empty((0, 5), dtype=int),
+            )
         iou_matrix = iou_batch(detections[:, :4], trackers[:, :4])
         row_ind, col_ind = linear_sum_assignment(-iou_matrix)
         matched_indices = np.array(list(zip(row_ind, col_ind)))
+
         if len(matched_indices) > 0:
             unmatched_dets = [d for d in range(len(detections)) if d not in matched_indices[:, 0]]
             unmatched_trks = [t for t in range(len(trackers)) if t not in matched_indices[:, 1]]
         else:
             unmatched_dets = []
             unmatched_trks = []
+
         matches = []
         for m in matched_indices:
             if iou_matrix[m[0], m[1]] < self.iou_threshold:
@@ -159,17 +184,21 @@ class Sort:
                 unmatched_trks.append(m[1])
             else:
                 matches.append(m.reshape(1, 2))
+
         if len(matches) == 0:
             matches = np.empty((0, 2), dtype=int)
         else:
             matches = np.concatenate(matches, axis=0)
+
         return matches, np.array(unmatched_dets), np.array(unmatched_trks)
 
+
+# ---------- CLI ----------
 
 def parse_args():
     p = argparse.ArgumentParser("YOLO + SORT + RTMP Output")
     p.add_argument("--weights", type=str, required=True)
-    p.add_argument("--source", type=str, default='rtmp://nginx-rtmp:1935/live/stream')
+    p.add_argument("--source", type=str, default="rtmp://nginx-rtmp:1935/live/stream")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--imgsz", type=int, default=640)
     p.add_argument("--conf", type=float, default=0.50)
@@ -180,42 +209,44 @@ def parse_args():
     p.add_argument("--min-hits", type=int, default=3)
     p.add_argument("--iou-threshold", type=float, default=0.3)
     p.add_argument("--max-area-frac", type=float, default=0.25)
-    p.add_argument("--output-rtmp", type=str, required=True, help="RTMP output URL")  # CHANGED
-    p.add_argument("--fps", type=int, default=25, help="Output FPS")
+    p.add_argument("--output-rtmp", type=str, required=True)
+    p.add_argument("--fps", type=int, default=25)
     return p.parse_args()
 
 
+# ---------- RTMP Output via ffmpeg ----------
+
 class RTMPStreamer:
-    def __init__(self, rtmp_url, width, height, fps=30):
+    def __init__(self, rtmp_url, width, height, fps=25):
         self.rtmp_url = rtmp_url
         self.width = width
         self.height = height
         self.fps = fps
         self.process = None
-        self.frame_queue = queue.Queue(maxsize=10)  # Limit queue size
+        self.frame_queue = queue.Queue(maxsize=10)
         self.running = False
 
     def start(self):
         cmd = [
-            'ffmpeg',
-            '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-s', f'{self.width}x{self.height}',
-            '-r', str(self.fps),
-            '-i', '-',  # Read from stdin
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-tune', 'zerolatency',
-            '-profile:v', 'baseline',
-            '-pix_fmt', 'yuv420p',
-            '-b:v', '3000k',  # Bitrate limit
-            '-maxrate', '3000k',
-            '-bufsize', '6000k',
-            '-g', str(self.fps * 2),  # Keyframe interval
-            '-f', 'flv',
-            self.rtmp_url
+            "ffmpeg",
+            "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-s", f"{self.width}x{self.height}",
+            "-r", str(self.fps),
+            "-i", "-",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-tune", "zerolatency",
+            "-profile:v", "baseline",
+            "-pix_fmt", "yuv420p",
+            "-b:v", "3000k",
+            "-maxrate", "3000k",
+            "-bufsize", "6000k",
+            "-g", str(self.fps * 2),
+            "-f", "flv",
+            self.rtmp_url,
         ]
 
         self.process = subprocess.Popen(
@@ -223,128 +254,159 @@ class RTMPStreamer:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            bufsize=10 ** 8  # Large buffer
+            bufsize=10**8,
         )
-
         self.running = True
 
-        # Start thread to consume stderr (prevent blocking)
-        self.stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
-        self.stderr_thread.start()
-
-        # Start thread to write frames
-        self.write_thread = threading.Thread(target=self._write_frames, daemon=True)
-        self.write_thread.start()
+        threading.Thread(target=self._read_stderr, daemon=True).start()
+        threading.Thread(target=self._write_frames, daemon=True).start()
 
         print(f"[RTMP] Streaming to {self.rtmp_url}")
 
     def _read_stderr(self):
-        """Consume stderr to prevent pipe blocking"""
-        while self.running:
+        while self.running and self.process and self.process.stderr:
             try:
                 line = self.process.stderr.readline()
                 if not line:
                     break
-                # Optionally print errors
-                # print(f"[FFmpeg] {line.decode().strip()}")
-            except:
+            except Exception:
                 break
 
     def _write_frames(self):
-        """Write frames from queue to FFmpeg stdin"""
         while self.running:
             try:
                 frame = self.frame_queue.get(timeout=1)
-                if frame is None:  # Poison pill
+                if frame is None:
                     break
                 self.process.stdin.write(frame.tobytes())
             except queue.Empty:
                 continue
             except BrokenPipeError:
-                print("[RTMP] Broken pipe - FFmpeg died")
+                print("[RTMP] Broken pipe - ffmpeg died")
                 break
             except Exception as e:
                 print(f"[RTMP] Write error: {e}")
                 break
 
     def write_frame(self, frame):
-        """Add frame to queue (non-blocking)"""
         try:
             self.frame_queue.put_nowait(frame)
         except queue.Full:
-            # Drop frame if queue is full (prevents blocking)
+            # drop frame if output is overloaded
             pass
 
     def stop(self):
-        """Stop streaming"""
         self.running = False
-
-        # Send poison pill
         try:
-            self.frame_queue.put(None, timeout=1)
-        except:
+            self.frame_queue.put_nowait(None)
+        except Exception:
             pass
-
-        # Close stdin
-        if self.process and self.process.stdin:
-            try:
-                self.process.stdin.close()
-            except:
-                pass
-
-        # Wait for process
         if self.process:
+            try:
+                if self.process.stdin:
+                    self.process.stdin.close()
+            except Exception:
+                pass
             try:
                 self.process.wait(timeout=2)
-            except:
+            except Exception:
                 self.process.kill()
-
         print("[RTMP] Streaming stopped")
-class HLSWriter:
-    """Write frames to HLS using FFmpeg"""
 
-    def __init__(self, output_path, width, height, fps=25):
-        self.output_path = output_path
+
+# ---------- FFmpeg Reader for RTMP Input ----------
+
+class FFmpegReader:
+    """
+    ffmpeg -fflags nobuffer -flags low_delay -rtmp_buffer 10 -rtmp_live live \
+           -i rtmp://... -an -vf scale=WIDTH:HEIGHT -c:v rawvideo -pix_fmt bgr24 -f rawvideo -
+    """
+
+    def __init__(self, src, width, height):
+        self.src = src
+        self.width = width
+        self.height = height
         self.process = None
+        self.thread = None
+        self.frame_queue = queue.Queue(maxsize=1)  # keep only latest frame
+        self.running = False
 
-        # FFmpeg command for HLS output
+    def start(self):
         cmd = [
-            'ffmpeg',
-            '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-s', f'{width}x{height}',
-            '-r', str(fps),
-            '-i', '-',
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-tune', 'zerolatency',
-            '-f', 'hls',
-            '-hls_time', '2',
-            '-hls_list_size', '5',
-            '-hls_flags', 'delete_segments',
-            output_path
+            "ffmpeg",
+            "-loglevel", "warning",
+            "-fflags", "nobuffer",
+            "-flags", "low_delay",
+            "-rtmp_buffer", "10",
+            "-rtmp_live", "live",
+            "-i", self.src,
+            "-an",
+            "-vf", f"scale={self.width}:{self.height}",
+            "-c:v", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-f", "rawvideo",
+            "-",
         ]
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            bufsize=self.width * self.height * 3 * 4,
+        )
+        self.running = True
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.thread.start()
+        print(f"[FFMPEG-READER] Started for {self.src} @ {self.width}x{self.height}")
 
-        self.process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        print(f"[HLS] Started streaming to {output_path}")
+    def _reader_loop(self):
+        frame_size = self.width * self.height * 3
+        try:
+            while self.running and self.process and self.process.stdout:
+                data = self.process.stdout.read(frame_size)
+                if not data or len(data) < frame_size:
+                    break
+                frame = np.frombuffer(data, dtype=np.uint8)
+                if frame.size != frame_size:
+                    break
+                frame = frame.reshape((self.height, self.width, 3))
 
-    def write(self, frame):
-        if self.process and self.process.stdin:
-            try:
-                self.process.stdin.write(frame.tobytes())
-            except:
-                pass
+                if self.frame_queue.full():
+                    try:
+                        self.frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                try:
+                    self.frame_queue.put_nowait(frame)
+                except queue.Full:
+                    pass
+        finally:
+            self.running = False
+            print("[FFMPEG-READER] Reader loop stopped")
 
-    def release(self):
+    def read(self, timeout=1.0):
+        try:
+            return self.frame_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def stop(self):
+        self.running = False
         if self.process:
-            self.process.stdin.close()
-            self.process.wait()
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=2)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        print("[FFMPEG-READER] Stopped")
 
+
+# ---------- Misc ----------
 
 def create_waiting_frame(width=1280, height=720, message="Waiting for input..."):
-    """Create a placeholder frame"""
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     font = cv2.FONT_HERSHEY_SIMPLEX
     (tw, th), _ = cv2.getTextSize(message, font, 1.0, 2)
@@ -354,10 +416,15 @@ def create_waiting_frame(width=1280, height=720, message="Waiting for input...")
     return frame
 
 
+# ---------- Main ----------
+
 def main():
     args = parse_args()
 
-    # Load model
+    # fixed output size; ffmpeg reader scales incoming stream to this
+    WIDTH, HEIGHT = 1280, 720
+
+    # Load YOLO
     weights_path = Path(args.weights)
     if not weights_path.exists():
         raise FileNotFoundError(f"Model not found: {args.weights}")
@@ -365,122 +432,100 @@ def main():
         weights_path = weights_path.parent
 
     print(f"[INFO] Loading model: {weights_path}")
-    model = YOLO(str(weights_path), task='detect')
+    model = YOLO(str(weights_path), task="detect")
 
     # SORT tracker
-    tracker = Sort(max_age=args.max_age, min_hits=args.min_hits, iou_threshold=args.iou_threshold)
+    tracker = Sort(
+        max_age=args.max_age,
+        min_hits=args.min_hits,
+        iou_threshold=args.iou_threshold,
+    )
 
     # Parse classes
     classes = None
     if args.classes.strip():
         classes = [int(x) for x in args.classes.split(",") if x.strip().isdigit()]
 
-    # Color palette
+    # Colors
     np.random.seed(42)
     colors = np.random.randint(0, 255, size=(200, 3), dtype=np.uint8)
 
-    # Initialize RTMP writer FIRST with default dimensions
-    default_width = 1280
-    default_height = 720
-
+    # RTMP output
     print(f"[INFO] Starting RTMP output to: {args.output_rtmp}")
-    rtmp_writer = RTMPStreamer(args.output_rtmp, default_width, default_height, args.fps)
+    rtmp_writer = RTMPStreamer(args.output_rtmp, WIDTH, HEIGHT, args.fps)
     rtmp_writer.start()
 
-    # Create waiting frame
-    waiting_frame = create_waiting_frame(default_width, default_height)
+    waiting_frame = create_waiting_frame(WIDTH, HEIGHT)
 
-    cap = None
     frame_count = 0
-    stream_active = False
+    reader = None
 
-    print(f"[INFO] Connecting to input: {args.source}")
+    # how often to run YOLO (1 = every frame, 2 = every 2nd, etc.)
+    YOLO_EVERY_N_FRAMES = 3
+
+    print(f"[INFO] Input source: {args.source}")
 
     try:
         while True:
-            # Try to connect if not connected
-            if cap is None or not cap.isOpened():
-                if stream_active:
-                    print("[WARN] Input stream lost, switching to waiting mode...")
-                    stream_active = False
+            # (Re)start reader only if it actually died
+            if reader is None or not reader.running:
+                if reader is not None:
+                    reader.stop()
+                    time.sleep(1.0)
+                print("[INFO] (Re)starting FFmpegReader...")
+                reader = FFmpegReader(args.source, WIDTH, HEIGHT)
+                reader.start()
+                time.sleep(0.3)  # small warmup
 
-                cap = cv2.VideoCapture(args.source, cv2.CAP_FFMPEG)
+            frame = reader.read(timeout=2.0)
 
-                if not cap.isOpened():
-                    # Send waiting frame
-                    rtmp_writer.write_frame(waiting_frame)
-                    time.sleep(0.04)  # ~25fps
-                    continue
-
-                # Get stream properties
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                fps = cap.get(cv2.CAP_PROP_FPS) or args.fps
-
-                print(f"[INFO] Input connected: {width}x{height} @ {fps:.1f} FPS")
-
-                # Restart writer with correct dimensions if needed
-                if width != rtmp_writer.width or height != rtmp_writer.height:
-                    print(f"[INFO] Restarting RTMP writer with new dimensions...")
-                    rtmp_writer.stop()
-                    rtmp_writer = RTMPStreamer(args.output_rtmp, width, height, args.fps)
-                    rtmp_writer.start()
-                    waiting_frame = create_waiting_frame(width, height)
-
-                stream_active = True
-                frame_count = 0
-
-            # Try to read frame
-            ret, frame = cap.read()
-            if not ret:
-                # Send waiting frame on failure
+            if frame is None:
+                # No frame yet → publisher not started or momentary hiccup.
+                # DO NOT kill reader here. Just show waiting frame.
+                print("[WARN] No frame received yet, sending waiting frame...")
                 rtmp_writer.write_frame(waiting_frame)
-
-                if stream_active:
-                    print("[WARN] Failed to read frame, reconnecting...")
-                    stream_active = False
-
-                cap.release()
-                cap = None
-                time.sleep(1)
+                time.sleep(0.1)
                 continue
 
             frame_count += 1
+            run_yolo = (frame_count % YOLO_EVERY_N_FRAMES == 1)
 
-            # Run detection
-            results = model(
-                frame,
-                imgsz=args.imgsz,
-                conf=args.conf,
-                iou=args.iou,
-                max_det=args.max_det,
-                classes=classes,
-                verbose=False,
-            )
+            if run_yolo:
+                results = model(
+                    frame,
+                    device=args.device,
+                    imgsz=args.imgsz,
+                    conf=args.conf,
+                    iou=args.iou,
+                    max_det=args.max_det,
+                    classes=classes,
+                    verbose=False,
+                )
 
-            # Extract detections
-            boxes = results[0].boxes
-            if len(boxes) > 0:
-                dets = boxes.xyxy.cpu().numpy()
-                scores = boxes.conf.cpu().numpy()
+                boxes = results[0].boxes
+                if len(boxes) > 0:
+                    dets = boxes.xyxy.cpu().numpy()
+                    scores = boxes.conf.cpu().numpy()
 
-                # Filter by area
-                if args.max_area_frac > 0:
-                    frame_area = frame.shape[0] * frame.shape[1]
-                    areas = (dets[:, 2] - dets[:, 0]) * (dets[:, 3] - dets[:, 1])
-                    valid_mask = areas <= (frame_area * args.max_area_frac)
-                    dets = dets[valid_mask]
-                    scores = scores[valid_mask]
+                    if args.max_area_frac > 0:
+                        frame_area = frame.shape[0] * frame.shape[1]
+                        areas = (dets[:, 2] - dets[:, 0]) * (dets[:, 3] - dets[:, 1])
+                        valid_mask = areas <= (frame_area * args.max_area_frac)
+                        dets = dets[valid_mask]
+                        scores = scores[valid_mask]
 
-                if len(dets) > 0:
-                    dets_with_score = np.column_stack((dets, scores))
-                    tracks = tracker.update(dets_with_score)
+                    if len(dets) > 0:
+                        dets_with_score = np.column_stack((dets, scores))
+                        _ = tracker.update(dets_with_score)
+                    else:
+                        _ = tracker.update(np.empty((0, 5)))
                 else:
-                    tracks = tracker.update(np.empty((0, 5)))
+                    _ = tracker.update(np.empty((0, 5)))
             else:
-                tracks = tracker.update(np.empty((0, 5)))
+                # No YOLO this frame: advance tracker only (no new detections)
+                _ = tracker.update(np.empty((0, 5)))
 
-            # Draw tracks
+            # Draw tracker state on every frame
             output_frame = frame.copy()
             for track in tracker.trackers:
                 d = track.get_state()[0]
@@ -492,7 +537,7 @@ def main():
                 x2 = min(frame.shape[1], x2)
                 y2 = min(frame.shape[0], y2)
 
-                color = tuple(map(int, colors[track_id % len(colors)]))
+                color = tuple(int(c) for c in colors[track_id % len(colors)])
                 thickness = 2 if track.hit_streak >= args.min_hits else 1
 
                 cv2.rectangle(output_frame, (x1, y1), (x2, y2), color, thickness)
@@ -503,15 +548,27 @@ def main():
 
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 cv2.rectangle(output_frame, (x1, y1 - th - 4), (x1 + tw + 4, y1), color, -1)
-                cv2.putText(output_frame, label, (x1 + 2, y1 - 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(
+                    output_frame,
+                    label,
+                    (x1 + 2, y1 - 2),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1,
+                )
 
-            # Add info overlay
-            info = f"Frame: {frame_count} | Tracks: {len(tracker.trackers)}"
-            cv2.putText(output_frame, info, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            info = f"Frame: {frame_count} | Tracks: {len(tracker.trackers)} | YOLO: {run_yolo}"
+            cv2.putText(
+                output_frame,
+                info,
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
 
-            # Write to RTMP (always sends frame)
             rtmp_writer.write_frame(output_frame)
 
             if frame_count % 100 == 0:
@@ -520,11 +577,12 @@ def main():
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down...")
     finally:
-        if cap is not None:
-            cap.release()
+        if reader is not None:
+            reader.stop()
         rtmp_writer.stop()
         print("[INFO] Stopped")
 
 
 if __name__ == "__main__":
     main()
+
